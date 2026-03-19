@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The name of your project. This is the name PyPI will use.
+name = "code-seach"
+# The project's version (e.g., v0.1.0)
+version = "0.0.1"
+# A short description of your project
+description = "Index code, then search it"
+# The primary author/maintainer
+authors = [
+    {name = "Andreas Paepcke", email = "paepcke@cs.stanford.edu"},
+]
+# A list of maintainers (can be the same as authors)
+maintainers = [
+    {name = "Andreas Paepcke", email = "paepcke@cs.stanford.edu"},
+]
+# A short description of the license
+license = {text = "MIT License"} # Replace with your actual license, e.g., MIT, Apache-2.0, etc.
+# A longer description (often read from a README file)
+readme = "README.md"
+
+# The minimum Python version required
+requires-python = ">=3.12"
+
+# Classifiers help users find your project on PyPI
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# Project URLs (your repository link)
+urls = {Repository = "https://github.com/paepcke/photo-index.git"}
+
+# Specify any dependencies your project needs
+dependencies = [
+    # Example dependencies:
+    "logging-singleton>=1.0.1",
+    "requests>=2.32.5",
+    "ollama>=0.6.1",
+    "qdrant-client>=1.17.1",
+    "sentence-transformers>=5.3.0",
+    "tree-sitter>=0.25.2",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-bash>=0.25.1"
+]
+
+# Optional groups of dependencies (e.g., for development or testing)
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.1",
+    "ffmpeg-python>=0.2.0"
+]
+
+# Configuration for tools/packaging backend
+[tool.setuptools]
+# The source code root directory is configured here:
+# <project-root>/src is where setuptools will look for your package (e.g., src/photo_index)
+package-dir = {"" = "src"}
