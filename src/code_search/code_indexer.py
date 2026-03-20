@@ -1,20 +1,20 @@
 #!/usr/bin/env python
-###############################################
+# ##############################################
 # -*- coding: utf-8 -*-
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:10:41
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-18 18:12:30
-###############################################
+# @Last Modified time: 2026-03-18 18:46:06
+# ##############################################
 
 """
 code_indexer.py  --  Semantic code indexer for personal Python/Bash repositories.
 
 Walks one or more root directories, extracts function- and class-level chunks
 from ``*.py`` and ``*.sh`` files using tree-sitter, embeds each chunk with
-``nomic-embed-code`` via sentence-transformers, and upserts them into a
-file-based Qdrant collection.  Re-runs are incremental: only files whose
-mtime has changed since the last run are re-processed.
+``nomic-embed-text`` via Ollama, and upserts them into a file-based Qdrant
+collection.  Re-runs are incremental: only files whose mtime has changed
+since the last run are re-processed.
 
 Usage
 -----
@@ -31,8 +31,9 @@ Options
 
 Dependencies
 ------------
-    pip install qdrant-client sentence-transformers tree-sitter \
+    pip install qdrant-client requests tree-sitter \
                 tree-sitter-python tree-sitter-bash
+    ollama pull nomic-embed-text   # one-time model download
 """
 
 import argparse
@@ -50,7 +51,7 @@ from qdrant_client.models import (
     PointStruct,
     VectorParams,
 )
-from sentence_transformers import SentenceTransformer
+import requests
 from tree_sitter import Language, Node, Parser
 import tree_sitter_python as tspython
 import tree_sitter_bash as tsbash
@@ -60,8 +61,9 @@ import tree_sitter_bash as tsbash
 # Constants
 # ---------------------------------------------------------------------------
 
-EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
-EMBEDDING_DIM = 768          # nomic-embed-code output dimension
+OLLAMA_EMBED_MODEL = "nomic-embed-text"
+EMBEDDING_DIM = 768          # nomic-embed-text output dimension
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
 COLLECTION_NAME = "code_index"
 DEFAULT_INDEX_DIR = Path.home() / ".code_index"
 MANIFEST_FILENAME = "mtime_manifest.json"
@@ -291,8 +293,8 @@ class CodeIndexer:
 
     :param index_dir:    Directory for Qdrant storage and the mtime manifest.
     :param collection:   Qdrant collection name.
-    :param batch_size:   Number of chunks to embed in one sentence-transformers
-                         call.
+    :param batch_size:   Number of chunks to embed per Ollama request.
+    :param ollama_url:   Base URL for the Ollama REST API.
     :param force:        When True, ignore mtime manifest and re-index all.
     :param verbose:      When True, print each file as it is processed.
     """
@@ -302,29 +304,62 @@ class CodeIndexer:
         index_dir: Path,
         collection: str = COLLECTION_NAME,
         batch_size: int = 32,
+        ollama_url: str = DEFAULT_OLLAMA_URL,
         force: bool = False,
         verbose: bool = False,
     ) -> None:
         self._index_dir = index_dir
         self._collection = collection
         self._batch_size = batch_size
+        self._embed_url = f"{ollama_url.rstrip('/')}/api/embed"
         self._force = force
         self._verbose = verbose
 
         index_dir.mkdir(parents=True, exist_ok=True)
 
-        print("Loading embedding model … (first run downloads ~550 MB)")
-        self._model = SentenceTransformer(
-            EMBEDDING_MODEL,
-            trust_remote_code=True,
-        )
+        print(f"Embedding model : {OLLAMA_EMBED_MODEL} via Ollama")
+        self._check_ollama()
 
-        print("Opening Qdrant storage …")
+        print("Opening Qdrant storage ...")
         self._qdrant = QdrantClient(path=str(index_dir / "qdrant_storage"))
         self._ensure_collection()
 
         self._chunker = CodeChunker()
         self._manifest = MtimeManifest(index_dir / MANIFEST_FILENAME)
+
+    # ------------------------------------------------------------------
+    def _check_ollama(self) -> None:
+        """Verify Ollama is reachable and the embed model is available.
+
+        :raises SystemExit: If Ollama cannot be reached or the model is absent.
+        """
+        try:
+            resp = requests.get(
+                self._embed_url.replace("/api/embed", "/api/tags"),
+                timeout=5,
+            )
+            resp.raise_for_status()
+            models = [m["name"] for m in resp.json().get("models", [])]
+            # Ollama tags may include ":latest" suffix
+            available = any(
+                m == OLLAMA_EMBED_MODEL or m.startswith(OLLAMA_EMBED_MODEL + ":")
+                for m in models
+            )
+            if not available:
+                print(
+                    f"ERROR: model '{OLLAMA_EMBED_MODEL}' not found in Ollama.\n"
+                    f"Run:  ollama pull {OLLAMA_EMBED_MODEL}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"  Ollama reachable, model '{OLLAMA_EMBED_MODEL}' present.")
+        except requests.exceptions.ConnectionError:
+            print(
+                f"ERROR: Cannot connect to Ollama at {self._embed_url}.\n"
+                "Is 'ollama serve' running?",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # ------------------------------------------------------------------
     def _ensure_collection(self) -> None:
@@ -451,21 +486,32 @@ class CodeIndexer:
 
     # ------------------------------------------------------------------
     def _embed_and_upsert(self, chunks: list[dict]) -> None:
-        """Embed *chunks* and upsert them into Qdrant.
+        """Embed *chunks* via Ollama and upsert them into Qdrant.
 
         :param chunks: List of chunk dicts (must include 'filepath').
         """
-        # nomic-embed-code uses a task prefix for asymmetric retrieval.
-        # Code passages use the 'passage' prefix.
-        texts = [
-            f"passage: {c['text']}" for c in chunks
-        ]
-        vectors = self._model.encode(
-            texts,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        ).tolist()
+        # nomic-embed-text uses task prefixes for asymmetric retrieval.
+        # Code passages use the 'search_document' prefix at index time.
+        texts = [f"search_document: {c['text']}" for c in chunks]
+
+        try:
+            response = requests.post(
+                self._embed_url,
+                json={"model": OLLAMA_EMBED_MODEL, "input": texts},
+                timeout=120,
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            print(f"WARNING: embedding request failed — {exc}. Skipping batch.")
+            return
+
+        vectors = response.json().get("embeddings", [])
+        if len(vectors) != len(chunks):
+            print(
+                f"WARNING: expected {len(chunks)} embeddings, "
+                f"got {len(vectors)}. Skipping batch."
+            )
+            return
 
         points = [
             PointStruct(
@@ -515,6 +561,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Qdrant collection name. Default: {COLLECTION_NAME}",
     )
     p.add_argument(
+        "--ollama-url",
+        default=DEFAULT_OLLAMA_URL,
+        metavar="URL",
+        help=f"Ollama base URL. Default: {DEFAULT_OLLAMA_URL}",
+    )
+    p.add_argument(
         "--batch-size",
         type=int,
         default=32,
@@ -549,6 +601,7 @@ def main() -> None:
         index_dir=args.index_dir.expanduser().resolve(),
         collection=args.collection,
         batch_size=args.batch_size,
+        ollama_url=args.ollama_url,
         force=args.force,
         verbose=args.verbose,
     )
