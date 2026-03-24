@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-20 09:30:31
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 17:05:47
+# @Last Modified time: 2026-03-23 17:57:46
 # #############################################
 
 """
@@ -293,15 +293,9 @@ def query():
     answer = _call_llm(history)
     history.append({"role": "assistant", "content": answer})
 
-    # Strip 'text' from chunks before sending
-    slim_chunks = [
-        {k: v for k, v in c.items() if k != "text"}
-        for c in chunks
-    ]
-
     return jsonify({
         "answer":  answer,
-        "chunks":  slim_chunks,
+        "chunks":  chunks,
         "history": history,
     })
 
