@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:23:19
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 17:46:19
+# @Last Modified time: 2026-03-23 18:03:19
 # ############################################
 """
 code_query.py  --  Natural-language query interface for the semantic code index.
@@ -252,10 +252,10 @@ class ResultPrinter:
         print()
 
     def _print_chunk(self, index: int, chunk: dict) -> None:
-        filepath = chunk["filepath"]
-        start    = chunk["start_line"]
-        end      = chunk["end_line"]
-        kind     = chunk["kind"]
+        filepath = chunk.get("filepath", "?")
+        start    = chunk.get("start_line", "?")
+        end      = chunk.get("end_line", "?")
+        kind     = chunk.get("kind", "?")
         name     = chunk.get("name") or "(unnamed)"
         score    = chunk.get("score", 0.0)
 
@@ -264,10 +264,12 @@ class ResultPrinter:
         print(f"        Lines {start}–{end} │ {kind}: {name} │ score: {score:.4f}")
 
         # Print the text only if show_context is true
-        if self._show_context:
+        if self._show_context and "text" in chunk:
             print()
             lines = chunk["text"].splitlines()
-            for lineno, line in enumerate(lines, start=start):
+            # Handle cases where start might be '?'
+            start_idx = start if isinstance(start, int) else 1
+            for lineno, line in enumerate(lines, start=start_idx):
                 print(f"  {lineno:>6} │ {line}")
             print(f"\n  {THIN_RULE}")
 

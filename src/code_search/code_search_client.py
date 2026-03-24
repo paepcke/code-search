@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-20 09:31:24
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-20 09:32:54
+# @Last Modified time: 2026-03-23 18:03:56
 # #############################################
 
 """
@@ -15,21 +15,23 @@ Connects to a ``code_search_server.py`` instance running on a remote host
 ``code_query.py`` locally.  Conversation history is maintained here on the
 client and sent with every request.
 
+By default, it outputs ONLY the LLM's answer.
+
 Usage
 -----
     python code_search_client.py                        # connect to sextus:58008
-    python code_search_client.py --host 10.0.0.5       # explicit IP
+    python code_search_client.py --host 10.0.0.5        # explicit IP
     python code_search_client.py --host sextus.local    # mDNS name
     python code_search_client.py "opening question"     # answer then prompt
-    python code_search_client.py --no-interactive "..."  # single-shot
+    python code_search_client.py --no-interactive "..." # single-shot
 
 Options
 -------
-    --host   HOST   Hostname or IP of the server.  Default: sextus.local
-    --port   N      Server port.                   Default: 58008
-    --top-k  N      Chunks to retrieve.            Default: server default
-    --no-interactive   Single-shot mode.
-    --code-snippets    Print file paths only (server never sends code text).
+    --host   HOST     Hostname or IP of the server.  Default: sextus.local
+    --port   N        Server port.                   Default: 58008
+    --show-sources    Print the file paths and metadata of retrieved chunks.
+    --show-context    Print the exact text of the chunks fed to the LLM.
+    --no-interactive  Single-shot mode.
 
 Special commands (interactive mode)
 ------------------------------------
@@ -42,10 +44,9 @@ Dependencies
 """
 
 import argparse
-import readline  # noqa: F401  — side-effect: Emacs-style keys in input()
+import readline  # noqa: F401
 import sys
 import textwrap
-from pathlib import Path
 
 import requests
 
@@ -69,35 +70,22 @@ CMD_QUIT = {"quit", "exit", "/q"}
 # ---------------------------------------------------------------------------
 
 class CodeSearchClient:
-    """HTTP client for the code search server.
-
-    Maintains conversation history locally and sends it with every request
-    so the server can produce contextually aware follow-up answers.
-
-    :param host:          Hostname or IP address of the server.
-    :param port:          TCP port the server listens on.
-    :param show_snippets: When True, print chunk metadata in results.
-                          (The server never returns code text, only paths
-                          and line numbers, so this controls that display.)
-    """
+    """HTTP client for the code search server."""
 
     def __init__(
         self,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
-        show_snippets: bool = False,
+        show_sources: bool = False,
+        show_context: bool = False,
     ) -> None:
         self._base_url     = f"http://{host}:{port}"
-        self._show_snippets = show_snippets
+        self._show_sources = show_sources
+        self._show_context = show_context
         self._history: list[dict] = []
         self._check_server()
 
-    # ------------------------------------------------------------------
     def _check_server(self) -> None:
-        """Verify the server is reachable and print its configuration.
-
-        :raises SystemExit: If the server cannot be reached.
-        """
         try:
             resp = requests.get(f"{self._base_url}/", timeout=5)
             resp.raise_for_status()
@@ -117,23 +105,16 @@ class CodeSearchClient:
             print(f"ERROR: Server health check failed — {exc}", file=sys.stderr)
             sys.exit(1)
 
-    # ------------------------------------------------------------------
     def reset(self) -> None:
-        """Clear local conversation history to start a new topic."""
         self._history = []
 
-    # ------------------------------------------------------------------
     def query(self, question: str) -> None:
-        """Send *question* to the server and print the result.
-
-        :param question: Natural-language question from the user.
-        """
         print("Asking server ...")
         try:
             resp = requests.post(
                 f"{self._base_url}/query",
                 json={"question": question, "history": self._history},
-                timeout=180,      # LLM can be slow on a loaded machine
+                timeout=180,
             )
             resp.raise_for_status()
         except requests.exceptions.Timeout:
@@ -149,7 +130,6 @@ class CodeSearchClient:
             print(f"Server error: {data['error']}", file=sys.stderr)
             return
 
-        # Update local history from server response
         self._history = data.get("history", self._history)
 
         self._print_results(
@@ -158,19 +138,12 @@ class CodeSearchClient:
             answer=data.get("answer", ""),
         )
 
-    # ------------------------------------------------------------------
     def _print_results(
         self,
         question: str,
         chunks: list[dict],
         answer: str,
     ) -> None:
-        """Render one query result to stdout.
-
-        :param question: The user's question.
-        :param chunks:   Slim chunk dicts (no text field) from the server.
-        :param answer:   LLM explanation string.
-        """
         print()
         print(RULE)
         print(f"  QUERY:  {question}")
@@ -178,46 +151,49 @@ class CodeSearchClient:
 
         if not chunks:
             print("\n  No matching chunks found.\n")
-        else:
-            print(f"\n  {len(chunks)} chunk(s) retrieved:\n")
+            return
+
+        # Print LLM Answer First
+        if answer:
+            print("\n  ANSWER:\n")
+            for line in answer.splitlines():
+                if len(line) > 78:
+                    print(textwrap.fill(line, width=78, subsequent_indent="  "))
+                else:
+                    print(f"  {line}")
+            print()
+
+        # Print Sources / Context if requested (or if no answer was generated)
+        if self._show_sources or self._show_context or not answer:
+            print(RULE)
+            print(f"  RETRIEVED CONTEXT ({len(chunks)} chunks)")
+            print(RULE)
+            
             for i, chunk in enumerate(chunks, 1):
                 filepath = chunk.get("filepath", "?")
                 start    = chunk.get("start_line", "?")
-                end      = chunk.get("end_line",   "?")
-                kind     = chunk.get("kind",        "?")
+                end      = chunk.get("end_line", "?")
+                kind     = chunk.get("kind", "?")
                 name     = chunk.get("name") or "(unnamed)"
                 score    = chunk.get("score", 0.0)
 
-                print(f"  [{i}]  {filepath}")
-                print(f"        Lines {start}–{end}  │  "
-                      f"{kind}: {name}  │  score: {score:.4f}")
-                print()
-                print(f"  {THIN_RULE}")
-                print()
+                print(f"\n  [{i}] {filepath}")
+                print(f"        Lines {start}–{end} │ {kind}: {name} │ score: {score:.4f}")
 
-        if answer:
-            print(RULE)
-            print("  LLM EXPLANATION")
-            print(RULE)
+                # Print the text only if show_context is true AND the server provided it
+                if self._show_context and "text" in chunk:
+                    print()
+                    lines = chunk["text"].splitlines()
+                    start_idx = start if isinstance(start, int) else 1
+                    for lineno, line in enumerate(lines, start=start_idx):
+                        print(f"  {lineno:>6} │ {line}")
+                    print(f"\n  {THIN_RULE}")
             print()
-            for line in answer.splitlines():
-                if len(line) > 78:
-                    print(textwrap.fill(line, width=78,
-                                        subsequent_indent="  "))
-                else:
-                    print(line)
-            print()
-
+            
         print(RULE)
         print()
 
-    # ------------------------------------------------------------------
     def run_interactive(self, first_question: str = "") -> None:
-        """Enter the interactive REPL loop.
-
-        :param first_question: Optional opening question answered before
-                               the prompt appears (e.g. from the CLI).
-        """
         print()
         print(RULE)
         print("  Code Search Client  —  interactive mode")
@@ -245,9 +221,7 @@ class CodeSearchClient:
 
             if raw.lower() in CMD_NEW:
                 self.reset()
-                print()
-                print("  [conversation history cleared — new topic]")
-                print()
+                print("\n  [conversation history cleared — new topic]\n")
                 continue
 
             self.query(raw)
@@ -282,27 +256,32 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Server port. Default: {DEFAULT_PORT}",
     )
     p.add_argument(
+        "--show-sources",
+        action="store_true",
+        help="Print the file paths and metadata of retrieved chunks.",
+    )
+    p.add_argument(
+        "--show-context",
+        action="store_true",
+        help="Print the exact text of the chunks fed to the LLM.",
+    )
+    p.add_argument(
         "--no-interactive",
         action="store_true",
         help="Single-shot mode: answer one question and exit.",
-    )
-    p.add_argument(
-        "--no-llm",
-        action="store_true",
-        help="Ask server to skip LLM (not yet implemented server-side; "
-             "reserved for future use).",
     )
     return p
 
 
 def main() -> None:
-    """Entry point for the client CLI."""
     parser = _build_parser()
     args   = parser.parse_args()
 
     client = CodeSearchClient(
         host=args.host,
         port=args.port,
+        show_sources=args.show_sources,
+        show_context=args.show_context,
     )
 
     if args.no_interactive:
