@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:10:41
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 17:05:23
+# @Last Modified time: 2026-03-23 17:40:34
 # ##############################################
 
 """
@@ -85,8 +85,9 @@ MANIFEST_FILENAME = "mtime_manifest.json"
 PY_CHUNK_TYPES = {"function_definition", "class_definition"}
 SH_CHUNK_TYPES = {"function_definition"}
 
-# Minimum characters for a chunk to be worth embedding
-MIN_CHUNK_CHARS = 40
+# Minimum characters for a chunk to be worth embedding.
+# Lowered to 15 to ensure brief semantic skeletons (e.g. short docstrings) are kept.
+MIN_CHUNK_CHARS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,7 @@ class CodeChunker:
         text       -- the raw source text of the chunk
         start_line -- 1-based first line
         end_line   -- 1-based last line
-        kind       -- 'function' | 'class' | 'module_preamble'
+        kind       -- 'function' | 'class' | 'file_skeleton'
         name       -- identifier name when available, else ''
     """
 
@@ -132,20 +133,17 @@ class CodeChunker:
         tree = self._py_parser.parse(source)
         lines = source.decode("utf-8", errors="replace").splitlines()
         chunks: list[dict] = []
-        top_level_covered: list[tuple[int, int]] = []
 
+        # Extract individual functions and classes
         for node in self._walk_top_level(tree.root_node, PY_CHUNK_TYPES):
             chunk = self._node_to_chunk(node, lines)
             if chunk:
                 chunks.append(chunk)
-                top_level_covered.append(
-                    (node.start_point[0], node.end_point[0])
-                )
 
-        # Anything not inside a function/class becomes a module preamble chunk
-        preamble = self._preamble_chunk(lines, top_level_covered)
-        if preamble:
-            chunks.insert(0, preamble)
+        # Extract the semantic skeleton for the entire file
+        skeleton = self._semantic_skeleton(tree, lines, "python")
+        if skeleton:
+            chunks.insert(0, skeleton)
 
         return chunks
 
@@ -154,17 +152,17 @@ class CodeChunker:
         tree = self._sh_parser.parse(source)
         lines = source.decode("utf-8", errors="replace").splitlines()
         chunks: list[dict] = []
-        covered: list[tuple[int, int]] = []
 
+        # Extract individual functions
         for node in self._walk_top_level(tree.root_node, SH_CHUNK_TYPES):
             chunk = self._node_to_chunk(node, lines)
             if chunk:
                 chunks.append(chunk)
-                covered.append((node.start_point[0], node.end_point[0]))
 
-        preamble = self._preamble_chunk(lines, covered)
-        if preamble:
-            chunks.insert(0, preamble)
+        # Extract the semantic skeleton for the entire file
+        skeleton = self._semantic_skeleton(tree, lines, "bash")
+        if skeleton:
+            chunks.insert(0, skeleton)
 
         return chunks
 
@@ -213,28 +211,53 @@ class CodeChunker:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _preamble_chunk(
-        lines: list[str], covered: list[tuple[int, int]]
-    ) -> dict | None:
-        """Return a chunk for all lines NOT covered by any function/class."""
-        covered_set: set[int] = set()
-        for start, end in covered:
-            covered_set.update(range(start, end + 1))
+    def _semantic_skeleton(tree: Node, lines: list[str], lang: str) -> dict | None:
+        """Create a concentrated chunk of all comments, docstrings, and signatures."""
+        lines_to_keep: set[int] = set()
 
-        preamble_lines = [
-            line
-            for i, line in enumerate(lines)
-            if i not in covered_set
-        ]
-        text = "\n".join(preamble_lines).strip()
+        def walk(node: Node) -> None:
+            # 1. Keep all comments
+            if node.type == 'comment':
+                lines_to_keep.update(range(node.start_point[0], node.end_point[0] + 1))
+            
+            # 2. Keep Python docstrings (unassigned string literals)
+            elif lang == "python" and node.type == 'expression_statement':
+                if len(node.children) == 1 and node.children[0].type == 'string':
+                    lines_to_keep.update(range(node.start_point[0], node.end_point[0] + 1))
+            
+            # 3. Keep signature lines for functions and classes
+            elif node.type in {'function_definition', 'class_definition'}:
+                # Ensure we grab the line with the actual name/identifier
+                for child in node.children:
+                    if child.type == 'identifier':
+                        lines_to_keep.add(child.start_point[0])
+                        break
+                else:
+                    # Fallback: grab the line where 'def' or 'class' starts
+                    lines_to_keep.add(node.start_point[0])
+
+            # Recurse through the tree
+            for child in node.children:
+                walk(child)
+
+        walk(tree.root_node)
+
+        if not lines_to_keep:
+            return None
+
+        # Build the text by pulling only the kept lines in their original order
+        skeleton_lines = [lines[i] for i in sorted(lines_to_keep) if i < len(lines)]
+        text = "\n".join(skeleton_lines).strip()
+        
         if len(text) < MIN_CHUNK_CHARS:
             return None
+            
         return {
             "text": text,
             "start_line": 1,
             "end_line": len(lines),
-            "kind": "module_preamble",
-            "name": "",
+            "kind": "file_skeleton",
+            "name": "semantic_summary",
         }
 
 
