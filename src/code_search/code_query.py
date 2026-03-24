@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:23:19
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 18:03:19
+# @Last Modified time: 2026-03-23 20:00:10
 # ############################################
 """
 code_query.py  --  Natural-language query interface for the semantic code index.
@@ -135,7 +135,7 @@ class CodeRetriever:
 # ---------------------------------------------------------------------------
 
 class LLMSynthesiser:
-    """Ask a local Ollama model to explain retrieved code chunks."""
+    """Ask a local Ollama model to explain retrieved code chunks and expand queries."""
 
     _SYSTEM = (
         "You are a concise assistant that answers questions about a personal "
@@ -144,6 +144,14 @@ class LLMSynthesiser:
         "Always cite the file path and line numbers when referring to specific "
         "code.  If the provided excerpts do not answer the question, say so "
         "in one sentence."
+    )
+    
+    _EXPAND_SYSTEM = (
+        "You are a search query expander for a codebase. "
+        "Given a user's question, output a single string combining the original "
+        "question with 3-4 highly relevant technical synonyms, related terms, "
+        "and rephrasings to maximize vector retrieval overlap. "
+        "Return ONLY the expanded query string, with no introductory text or formatting."
     )
 
     def __init__(
@@ -157,6 +165,29 @@ class LLMSynthesiser:
 
     def reset(self) -> None:
         self._history = []
+
+    def expand(self, question: str) -> str:
+        """Use the LLM to generate search synonyms to overcome vector vocabulary gaps."""
+        messages = [
+            {"role": "system", "content": self._EXPAND_SYSTEM},
+            {"role": "user", "content": question}
+        ]
+        try:
+            resp = requests.post(
+                self._chat_url,
+                json={
+                    "model":    self._model,
+                    "messages": messages,
+                    "stream":   False,
+                    "options":  {"temperature": 0.2},
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json().get("message", {}).get("content", "").strip()
+        except requests.exceptions.RequestException:
+            # Fallback to the original question if the LLM is busy/fails
+            return question
 
     def explain(self, question: str, chunks: list[dict]) -> str:
         context_parts = []
@@ -217,12 +248,18 @@ class ResultPrinter:
     def print_results(
         self,
         question: str,
+        expanded_query: str,
         chunks: list[dict],
         explanation: str | None,
     ) -> None:
         print()
         print(RULE)
         print(f"  QUERY:  {question}")
+        
+        # Display the expanded query if debugging flags are on
+        if (self._show_sources or self._show_context) and expanded_query and expanded_query != question:
+            print(f"  EXPANDED: {expanded_query}")
+            
         print(RULE)
 
         if not chunks:
@@ -263,11 +300,10 @@ class ResultPrinter:
         print(f"\n  [{index}] {filepath}")
         print(f"        Lines {start}–{end} │ {kind}: {name} │ score: {score:.4f}")
 
-        # Print the text only if show_context is true
+        # Print the text only if show_context is true and available
         if self._show_context and "text" in chunk:
             print()
             lines = chunk["text"].splitlines()
-            # Handle cases where start might be '?'
             start_idx = start if isinstance(start, int) else 1
             for lineno, line in enumerate(lines, start=start_idx):
                 print(f"  {lineno:>6} │ {line}")
@@ -311,13 +347,23 @@ class CodeQuerier:
         )
 
     def query(self, question: str) -> None:
-        chunks = self._retriever.retrieve(question)
+        expanded_query = question
+        
+        # 1. Expand the Query
+        if self._use_llm and self._synthesiser is not None:
+            print("Expanding query ...")
+            expanded_query = self._synthesiser.expand(question)
 
+        # 2. Retrieve using the EXPANDED query
+        chunks = self._retriever.retrieve(expanded_query)
+
+        # 3. Synthesize the answer using the ORIGINAL question
         explanation: str | None = None
         if self._use_llm and self._synthesiser is not None:
+            print("Asking LLM ...")
             explanation = self._synthesiser.explain(question, chunks)
 
-        self._printer.print_results(question, chunks, explanation)
+        self._printer.print_results(question, expanded_query, chunks, explanation)
 
     def reset(self) -> None:
         if self._synthesiser is not None:

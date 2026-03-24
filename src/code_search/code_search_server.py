@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-20 09:30:31
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 17:57:46
+# @Last Modified time: 2026-03-23 20:00:40
 # #############################################
 
 """
@@ -37,8 +37,6 @@ Afterwards:
 Use 
    sudo journalctl -u code-search -f
 to see when most recent indexing occurred.
-
-
 """
 
 import argparse
@@ -53,7 +51,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 import requests as _requests  # avoid shadowing Flask's `request`
 
-# Re-use the retriever and synthesiser from code_query.py
+# Re-use the retriever from code_query.py
 from code_search.code_query import (
     COLLECTION_NAME,
     DEFAULT_MODEL,
@@ -97,7 +95,7 @@ DEFAULT_PORT = 58008
 WATCH_DIRS_STR = os.environ.get("CODE_WATCH_DIRS", "")
 WATCH_DIRS = [Path(p).expanduser().resolve() for p in WATCH_DIRS_STR.split(":") if p.strip()]
 
-# System prompt
+# Prompts
 _SYSTEM = (
     "You are a concise assistant that answers questions about a personal "
     "Python and Bash codebase.  Answer in as few words as possible.  "
@@ -105,6 +103,14 @@ _SYSTEM = (
     "Always cite the file path and line numbers when referring to specific "
     "code.  If the provided excerpts do not answer the question, say so "
     "in one sentence."
+)
+
+_EXPAND_SYSTEM = (
+    "You are a search query expander for a codebase. "
+    "Given a user's question, output a single string combining the original "
+    "question with 3-4 highly relevant technical synonyms, related terms, "
+    "and rephrasings to maximize vector retrieval overlap. "
+    "Return ONLY the expanded query string, with no introductory text or formatting."
 )
 
 # ---------------------------------------------------------------------------
@@ -134,7 +140,6 @@ def _get_retriever() -> CodeRetriever:
 # ---------------------------------------------------------------------------
 
 def _needs_reindexing() -> bool:
-    """Quick, lock-free check to see if any tracked files have changed."""
     if not WATCH_DIRS:
         return False
         
@@ -143,7 +148,6 @@ def _needs_reindexing() -> bool:
     
     for root in WATCH_DIRS:
         for dirpath, dirnames, filenames in os.walk(root):
-            # Skip hidden dirs and common noise dirs
             dirnames[:] = [
                 d for d in dirnames
                 if not d.startswith(".")
@@ -158,7 +162,6 @@ def _needs_reindexing() -> bool:
     return False
 
 def _background_watcher():
-    """Polls directories every 60s and re-indexes if changes are detected."""
     while True:
         time.sleep(60)
         if _needs_reindexing():
@@ -166,14 +169,11 @@ def _background_watcher():
             
             with indexing_lock:
                 global _retriever
-                
-                # 1. Tear down the Qdrant client to release the RocksDB/SQLite lock
                 if _retriever is not None:
                     _retriever._qdrant.close()
                     _retriever = None
-                    gc.collect()  # Force OS to release the file handle
+                    gc.collect() 
                 
-                # 2. Run the indexer
                 try:
                     indexer = CodeIndexer(
                         index_dir=INDEX_DIR,
@@ -186,8 +186,6 @@ def _background_watcher():
                 except Exception as e:
                     logger.error(f"Indexing failed: {e}")
                 finally:
-                    # 3. Always ensure we close the indexer's Qdrant client
-                    # so the retriever can acquire it again on the next query
                     if 'indexer' in locals():
                         indexer._qdrant.close()
                         del indexer
@@ -195,7 +193,6 @@ def _background_watcher():
                     
                 logger.info("Indexing complete. Resuming queries.")
 
-# Start the daemon thread immediately when Gunicorn loads this module
 if WATCH_DIRS:
     logger.info(f"Starting background watcher for: {[str(p) for p in WATCH_DIRS]}")
     watcher_thread = threading.Thread(target=_background_watcher, daemon=True)
@@ -216,6 +213,28 @@ def _build_context(chunks: list[dict]) -> str:
         parts.append(f"{header}\n{chunk['text']}")
     return "\n\n".join(parts)
 
+
+def _call_llm_expand(question: str) -> str:
+    """Use LLM to generate search synonyms to overcome vector vocabulary gaps."""
+    messages = [
+        {"role": "system", "content": _EXPAND_SYSTEM},
+        {"role": "user", "content": question}
+    ]
+    try:
+        resp = _requests.post(
+            f"{OLLAMA_URL.rstrip('/')}/api/chat",
+            json={
+                "model":    LLM_MODEL,
+                "messages": messages,
+                "stream":   False,
+                "options":  {"temperature": 0.2},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("message", {}).get("content", "").strip()
+    except _requests.exceptions.RequestException:
+        return question
 
 def _call_llm(history: list[dict]) -> str:
     messages = [{"role": "system", "content": _SYSTEM}] + history
@@ -270,16 +289,19 @@ def query():
     if not isinstance(history, list):
         return jsonify({"error": "Field 'history' must be a list."}), 400
 
-    # Retrieval (Wrapped in the lock to wait if indexing is happening)
+    # 1. Expand the query for better retrieval
+    expanded_query = _call_llm_expand(question)
+
+    # 2. Retrieval (Wrapped in the lock to wait if indexing is happening)
     with indexing_lock:
         try:
             retriever = _get_retriever()
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 503
 
-        chunks = retriever.retrieve(question)
+        chunks = retriever.retrieve(expanded_query)
 
-    # Build user turn and append to history
+    # 3. Build user turn using the ORIGINAL question (prevents confusing the LLM)
     context      = _build_context(chunks)
     user_content = (
         f"QUESTION:\n{question}\n\n"
@@ -289,7 +311,7 @@ def query():
     history = list(history)
     history.append({"role": "user", "content": user_content})
 
-    # LLM synthesis
+    # 4. LLM synthesis
     answer = _call_llm(history)
     history.append({"role": "assistant", "content": answer})
 
@@ -297,6 +319,7 @@ def query():
         "answer":  answer,
         "chunks":  chunks,
         "history": history,
+        "expanded_query": expanded_query,  # Pass it back for debugging clients
     })
 
 

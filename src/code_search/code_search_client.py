@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-20 09:31:24
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 18:03:56
+# @Last Modified time: 2026-03-23 20:01:11
 # #############################################
 
 """
@@ -131,9 +131,13 @@ class CodeSearchClient:
             return
 
         self._history = data.get("history", self._history)
+        
+        # Grab the expanded query for debug printing
+        expanded_query = data.get("expanded_query", question)
 
         self._print_results(
             question=question,
+            expanded_query=expanded_query,
             chunks=data.get("chunks", []),
             answer=data.get("answer", ""),
         )
@@ -141,12 +145,18 @@ class CodeSearchClient:
     def _print_results(
         self,
         question: str,
+        expanded_query: str,
         chunks: list[dict],
         answer: str,
     ) -> None:
         print()
         print(RULE)
         print(f"  QUERY:  {question}")
+        
+        # Display the expanded query if debugging flags are on
+        if (self._show_sources or self._show_context) and expanded_query and expanded_query != question:
+            print(f"  EXPANDED: {expanded_query}")
+            
         print(RULE)
 
         if not chunks:
