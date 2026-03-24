@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-20 09:30:31
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-20 09:32:44
+# @Last Modified time: 2026-03-23 17:05:47
 # #############################################
 
 """
@@ -19,52 +19,42 @@ Start with Gunicorn (recommended)::
 
     gunicorn -w 1 -b 0.0.0.0:58008 code_search_server:app
 
-Or for quick testing::
-
-    python code_search_server.py          # uses port 58008
-    python code_search_server.py --port 12345
-
-Request
--------
-    POST /query
-    Content-Type: application/json
-
-    {
-        "question": "where is the sunset calculation?",
-        "history":  [                          # may be [] on first turn
-            {"role": "user",      "content": "..."},
-            {"role": "assistant", "content": "..."}
-        ]
-    }
-
-Response
---------
-    200 OK
-    {
-        "answer":   "The sunset calculation is in …",
-        "chunks":   [ { "filepath": "...", "start_line": 10,
-                        "end_line": 40, "kind": "function",
-                        "name": "calc_sunset", "score": 0.82 } ],
-        "history":  [ ... ]          # updated history to send on next turn
-    }
-
-    4xx / 5xx
-    { "error": "human-readable message" }
-
 Dependencies
 ------------
     pip install flask gunicorn qdrant-client requests
+
+A worker thread monitors all directories listed in the CODE_WATCH_DIRS 
+environment variable once a minute. Upon finding a change, it pauses
+query service, re-indexes, and resumes query serice. Incoming queries 
+are queued during the indexing. 
+
+The environment variable should be modified in the the systemd service
+file on the server machine: /etc/systemd/system/code-search.service.
+Afterwards:
+   sudo systemctl daemon-reload
+   sudo systemctl restart code-search
+
+Use 
+   sudo journalctl -u code-search -f
+to see when most recent indexing occurred.
+
+
 """
 
 import argparse
+import gc
+import logging
+import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, request
+import requests as _requests  # avoid shadowing Flask's `request`
 
-# Re-use the retriever and synthesiser from code_query.py which must be on
-# the Python path (or in the same directory).
-from code_query import (
+# Re-use the retriever and synthesiser from code_query.py
+from code_search.code_query import (
     COLLECTION_NAME,
     DEFAULT_MODEL,
     DEFAULT_OLLAMA_URL,
@@ -74,14 +64,27 @@ from code_query import (
     CodeRetriever,
 )
 
-import requests as _requests  # avoid shadowing Flask's `request`
+# Import indexer components for the background watcher
+from code_search.code_indexer import (
+    CodeIndexer,
+    MtimeManifest,
+    MANIFEST_FILENAME,
+)
 
+# ---------------------------------------------------------------------------
+# Logging Setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration  (overridable via environment variables for Gunicorn setups)
 # ---------------------------------------------------------------------------
-
-import os
 
 INDEX_DIR   = Path(os.environ.get("CODE_INDEX_DIR",   str(DEFAULT_INDEX_DIR))).expanduser()
 COLLECTION  = os.environ.get("CODE_COLLECTION",       COLLECTION_NAME)
@@ -90,8 +93,11 @@ LLM_MODEL   = os.environ.get("CODE_LLM_MODEL",        DEFAULT_MODEL)
 TOP_K       = int(os.environ.get("CODE_TOP_K",        str(DEFAULT_TOP_K)))
 DEFAULT_PORT = 58008
 
-# System prompt — matches the one in LLMSynthesiser but lives here so the
-# server controls it independently of the client.
+# Parse the colon-separated paths from the environment for the watcher thread
+WATCH_DIRS_STR = os.environ.get("CODE_WATCH_DIRS", "")
+WATCH_DIRS = [Path(p).expanduser().resolve() for p in WATCH_DIRS_STR.split(":") if p.strip()]
+
+# System prompt
 _SYSTEM = (
     "You are a concise assistant that answers questions about a personal "
     "Python and Bash codebase.  Answer in as few words as possible.  "
@@ -102,19 +108,16 @@ _SYSTEM = (
 )
 
 # ---------------------------------------------------------------------------
-# Flask app + lazy-initialised retriever
+# Flask app + Concurrency Setup
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 _retriever: CodeRetriever | None = None
+indexing_lock = threading.Lock()
 
 
 def _get_retriever() -> CodeRetriever:
-    """Return the shared CodeRetriever, initialising it on first call.
-
-    :return: Initialised ``CodeRetriever`` instance.
-    :raises RuntimeError: If the index directory does not exist.
-    """
+    """Return the shared CodeRetriever, initialising it on first call."""
     global _retriever
     if _retriever is None:
         _retriever = CodeRetriever(
@@ -127,15 +130,83 @@ def _get_retriever() -> CodeRetriever:
 
 
 # ---------------------------------------------------------------------------
+# Background Watcher
+# ---------------------------------------------------------------------------
+
+def _needs_reindexing() -> bool:
+    """Quick, lock-free check to see if any tracked files have changed."""
+    if not WATCH_DIRS:
+        return False
+        
+    manifest_path = INDEX_DIR / MANIFEST_FILENAME
+    manifest = MtimeManifest(manifest_path)
+    
+    for root in WATCH_DIRS:
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Skip hidden dirs and common noise dirs
+            dirnames[:] = [
+                d for d in dirnames
+                if not d.startswith(".")
+                and d not in {"__pycache__", "node_modules", ".git", "venv",
+                               ".venv", "env", "dist", "build", ".tox"}
+            ]
+            for fname in filenames:
+                p = Path(dirpath) / fname
+                if p.suffix in {".py", ".sh"}:
+                    if manifest.is_stale(p):
+                        return True
+    return False
+
+def _background_watcher():
+    """Polls directories every 60s and re-indexes if changes are detected."""
+    while True:
+        time.sleep(60)
+        if _needs_reindexing():
+            logger.info("Changes detected! Pausing queries to re-index...")
+            
+            with indexing_lock:
+                global _retriever
+                
+                # 1. Tear down the Qdrant client to release the RocksDB/SQLite lock
+                if _retriever is not None:
+                    _retriever._qdrant.close()
+                    _retriever = None
+                    gc.collect()  # Force OS to release the file handle
+                
+                # 2. Run the indexer
+                try:
+                    indexer = CodeIndexer(
+                        index_dir=INDEX_DIR,
+                        collection=COLLECTION,
+                        ollama_url=OLLAMA_URL,
+                        force=False,
+                        verbose=False
+                    )
+                    indexer.index_roots(WATCH_DIRS)
+                except Exception as e:
+                    logger.error(f"Indexing failed: {e}")
+                finally:
+                    # 3. Always ensure we close the indexer's Qdrant client
+                    # so the retriever can acquire it again on the next query
+                    if 'indexer' in locals():
+                        indexer._qdrant.close()
+                        del indexer
+                        gc.collect()
+                    
+                logger.info("Indexing complete. Resuming queries.")
+
+# Start the daemon thread immediately when Gunicorn loads this module
+if WATCH_DIRS:
+    logger.info(f"Starting background watcher for: {[str(p) for p in WATCH_DIRS]}")
+    watcher_thread = threading.Thread(target=_background_watcher, daemon=True)
+    watcher_thread.start()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _build_context(chunks: list[dict]) -> str:
-    """Format retrieved chunks into a text block for the LLM prompt.
-
-    :param chunks: List of payload dicts from Qdrant.
-    :return: Multi-line string with numbered excerpts.
-    """
     parts = []
     for i, chunk in enumerate(chunks, 1):
         header = (
@@ -147,12 +218,6 @@ def _build_context(chunks: list[dict]) -> str:
 
 
 def _call_llm(history: list[dict]) -> str:
-    """Send *history* to Ollama and return the assistant reply.
-
-    :param history: List of ``{role, content}`` dicts representing the full
-                    conversation so far, including the new user turn.
-    :return: Assistant response text, or an error string.
-    """
     messages = [{"role": "system", "content": _SYSTEM}] + history
     try:
         resp = _requests.post(
@@ -181,28 +246,18 @@ def _call_llm(history: list[dict]) -> str:
 
 @app.get("/")
 def health():
-    """Health-check endpoint.
-
-    :return: JSON status object.
-    """
     return jsonify({
         "status":     "ok",
         "index_dir":  str(INDEX_DIR),
         "llm_model":  LLM_MODEL,
         "embed_model": OLLAMA_EMBED_MODEL,
         "top_k":      TOP_K,
+        "watch_dirs": [str(d) for d in WATCH_DIRS],
     })
 
 
 @app.post("/query")
 def query():
-    """Answer one question and return the updated conversation history.
-
-    Expects JSON body with ``question`` (str) and ``history`` (list).
-    Returns JSON with ``answer``, ``chunks``, and updated ``history``.
-
-    :return: JSON response.
-    """
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"error": "Request body must be JSON."}), 400
@@ -215,13 +270,14 @@ def query():
     if not isinstance(history, list):
         return jsonify({"error": "Field 'history' must be a list."}), 400
 
-    # Retrieval
-    try:
-        retriever = _get_retriever()
-    except FileNotFoundError as exc:
-        return jsonify({"error": str(exc)}), 503
+    # Retrieval (Wrapped in the lock to wait if indexing is happening)
+    with indexing_lock:
+        try:
+            retriever = _get_retriever()
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 503
 
-    chunks = retriever.retrieve(question)
+        chunks = retriever.retrieve(question)
 
     # Build user turn and append to history
     context      = _build_context(chunks)
@@ -230,15 +286,14 @@ def query():
         f"RELEVANT CODE EXCERPTS:\n{context}\n\n"
         "ANSWER (be brief):"
     )
-    history = list(history)          # copy — don't mutate caller's list
+    history = list(history)
     history.append({"role": "user", "content": user_content})
 
     # LLM synthesis
     answer = _call_llm(history)
     history.append({"role": "assistant", "content": answer})
 
-    # Strip 'text' from chunks before sending — potentially large and the
-    # client doesn't need it (it has file paths + line numbers to open).
+    # Strip 'text' from chunks before sending
     slim_chunks = [
         {k: v for k, v in c.items() if k != "text"}
         for c in chunks
@@ -276,13 +331,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """Entry point for direct execution (dev/testing only)."""
     parser = _build_parser()
     args   = parser.parse_args()
-    print(f"Starting dev server on {args.host}:{args.port} — "
-          f"use Gunicorn for production.")
-    print(f"  Index : {INDEX_DIR}")
-    print(f"  Model : {LLM_MODEL}")
+    logger.info(f"Starting dev server on {args.host}:{args.port} — use Gunicorn for production.")
+    logger.info(f"  Index : {INDEX_DIR}")
+    logger.info(f"  Model : {LLM_MODEL}")
     app.run(host=args.host, port=args.port, debug=False)
 
 

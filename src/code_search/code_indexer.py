@@ -4,11 +4,24 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:10:41
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-18 18:46:06
+# @Last Modified time: 2026-03-23 17:05:23
 # ##############################################
 
 """
 code_indexer.py  --  Semantic code indexer for personal Python/Bash repositories.
+
+NOTE: used by code_search_server.py. Do not run directly.
+      See head comment of code_search_server.py for adding
+      new code directories.
+
+      The server automatically monitors a set of code directories
+      that are set in /etc/systemd/system/code-search.service. 
+      Re-indexing upon code changes occurs automatically. 
+
+      Use 
+         sudo journalctl -u code-search -f
+      
+      to see when most recent indexing occurred.
 
 Walks one or more root directories, extracts function- and class-level chunks
 from ``*.py`` and ``*.sh`` files using tree-sitter, embeds each chunk with
