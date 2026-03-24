@@ -4,15 +4,14 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:23:19
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 20:17:57
+# @Last Modified time: 2026-03-23 20:38:55
 # ############################################
-
 """
 code_query.py  --  Natural-language query interface for the semantic code index.
 
 Embeds natural-language questions with ``nomic-embed-text`` via Ollama,
-generates a sparse TF-IDF keyword vector, retrieves and mathematically merges 
-the most relevant hybrid chunks from Qdrant, and asks a local LLM to synthesise
+retrieves the most relevant code chunks from the file-based Qdrant collection
+built by ``code_indexer.py``, and asks a local LLM (via Ollama) to synthesise
 an answer.
 
 Usage
@@ -35,22 +34,17 @@ Options
 """
 
 import argparse
-import hashlib
-import re
 import readline  # noqa: F401
 import sys
 import textwrap
-from collections import Counter
 from pathlib import Path
 
 import requests
-from qdrant_client import QdrantClient, models
-
+from qdrant_client import QdrantClient
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
 OLLAMA_EMBED_MODEL  = "nomic-embed-text"
 EMBEDDING_DIM       = 768
 COLLECTION_NAME     = "code_index"
@@ -65,37 +59,9 @@ CMD_NEW  = {"new", "/new"}
 CMD_QUIT = {"quit", "exit", "/q"}
 
 # ---------------------------------------------------------------------------
-# Tokenizer / Sparse Vector Generator
-# ---------------------------------------------------------------------------
-
-def _to_sparse_vector(text: str) -> models.SparseVector | None:
-    """Must perfectly match the hashing strategy in code_indexer.py"""
-    tokens = re.findall(r'\b[a-zA-Z0-9_]+\b', text.lower())
-    if not tokens:
-        return None
-        
-    counts = Counter(tokens)
-    indices_values = []
-    
-    for token, freq in counts.items():
-        idx = int(hashlib.md5(token.encode('utf-8')).hexdigest()[:8], 16)
-        indices_values.append((idx, float(freq)))
-        
-    indices_values.sort(key=lambda x: x[0])
-    
-    return models.SparseVector(
-        indices=[x[0] for x in indices_values],
-        values=[x[1] for x in indices_values]
-    )
-
-
-# ---------------------------------------------------------------------------
 # Retriever
 # ---------------------------------------------------------------------------
-
 class CodeRetriever:
-    """Embed a query and perform Hybrid Search (Dense + Sparse) in Qdrant."""
-
     def __init__(
         self,
         index_dir: Path,
@@ -116,7 +82,6 @@ class CodeRetriever:
         self._qdrant = QdrantClient(path=str(qdrant_path))
 
     def retrieve(self, question: str) -> list[dict]:
-        # 1. Get Dense Vector
         try:
             resp = requests.post(
                 self._embed_url,
@@ -133,35 +98,10 @@ class CodeRetriever:
         if not embeddings:
             print("ERROR: Ollama returned no embeddings.", file=sys.stderr)
             return []
-            
-        dense_emb = embeddings[0]
 
-        # 2. Get Sparse Vector (TF mapped to Qdrant's IDF)
-        sparse_emb = _to_sparse_vector(question)
-
-        # 3. Build Prefetch rules for Hybrid fusion
-        prefetch = [
-            models.Prefetch(
-                query=dense_emb,
-                using="dense",
-                limit=self._top_k * 2,
-            )
-        ]
-        
-        if sparse_emb is not None:
-            prefetch.append(
-                models.Prefetch(
-                    query=sparse_emb,
-                    using="sparse",
-                    limit=self._top_k * 2,
-                )
-            )
-
-        # 4. Execute Hybrid Search using Reciprocal Rank Fusion (RRF)
         result = self._qdrant.query_points(
             collection_name=self._collection,
-            prefetch=prefetch,
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            query=embeddings[0],
             limit=self._top_k,
             with_payload=True,
         )
@@ -169,16 +109,13 @@ class CodeRetriever:
         hits = []
         for hit in result.points:
             payload = dict(hit.payload)
-            payload["score"] = round(hit.score, 4) if hit.score else 0.0
+            payload["score"] = round(hit.score, 4)
             hits.append(payload)
-            
         return hits
-
 
 # ---------------------------------------------------------------------------
 # LLM synthesiser
 # ---------------------------------------------------------------------------
-
 class LLMSynthesiser:
     _SYSTEM = (
         "You are a concise assistant that answers questions about a personal "
@@ -187,14 +124,6 @@ class LLMSynthesiser:
         "Always cite the file path and line numbers when referring to specific "
         "code.  If the provided excerpts do not answer the question, say so "
         "in one sentence."
-    )
-    
-    _EXPAND_SYSTEM = (
-        "You are a search query expander for a codebase. "
-        "Given a user's question, output a single string combining the original "
-        "question with 3-4 highly relevant technical synonyms, related terms, "
-        "and rephrasings to maximize vector retrieval overlap. "
-        "Return ONLY the expanded query string, with no introductory text or formatting."
     )
 
     def __init__(
@@ -208,27 +137,6 @@ class LLMSynthesiser:
 
     def reset(self) -> None:
         self._history = []
-
-    def expand(self, question: str) -> str:
-        messages = [
-            {"role": "system", "content": self._EXPAND_SYSTEM},
-            {"role": "user", "content": question}
-        ]
-        try:
-            resp = requests.post(
-                self._chat_url,
-                json={
-                    "model":    self._model,
-                    "messages": messages,
-                    "stream":   False,
-                    "options":  {"temperature": 0.2},
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            return resp.json().get("message", {}).get("content", "").strip()
-        except requests.exceptions.RequestException:
-            return question
 
     def explain(self, question: str, chunks: list[dict]) -> str:
         context_parts = []
@@ -274,11 +182,9 @@ class LLMSynthesiser:
         self._history.append({"role": "assistant", "content": answer})
         return answer
 
-
 # ---------------------------------------------------------------------------
 # Printer
 # ---------------------------------------------------------------------------
-
 class ResultPrinter:
     def __init__(self, show_sources: bool = False, show_context: bool = False) -> None:
         self._show_sources = show_sources
@@ -287,17 +193,12 @@ class ResultPrinter:
     def print_results(
         self,
         question: str,
-        expanded_query: str,
         chunks: list[dict],
         explanation: str | None,
     ) -> None:
         print()
         print(RULE)
         print(f"  QUERY:  {question}")
-        
-        if (self._show_sources or self._show_context) and expanded_query and expanded_query != question:
-            print(f"  EXPANDED: {expanded_query}")
-            
         print(RULE)
 
         if not chunks:
@@ -343,11 +244,9 @@ class ResultPrinter:
                 print(f"  {lineno:>6} │ {line}")
             print(f"\n  {THIN_RULE}")
 
-
 # ---------------------------------------------------------------------------
 # Querier
 # ---------------------------------------------------------------------------
-
 class CodeQuerier:
     def __init__(
         self,
@@ -379,20 +278,13 @@ class CodeQuerier:
         )
 
     def query(self, question: str) -> None:
-        expanded_query = question
-        
-        if self._use_llm and self._synthesiser is not None:
-            print("Expanding query ...")
-            expanded_query = self._synthesiser.expand(question)
-
-        chunks = self._retriever.retrieve(expanded_query)
+        chunks = self._retriever.retrieve(question)
 
         explanation: str | None = None
         if self._use_llm and self._synthesiser is not None:
-            print("Asking LLM ...")
             explanation = self._synthesiser.explain(question, chunks)
 
-        self._printer.print_results(question, expanded_query, chunks, explanation)
+        self._printer.print_results(question, chunks, explanation)
 
     def reset(self) -> None:
         if self._synthesiser is not None:
@@ -431,11 +323,9 @@ class CodeQuerier:
 
             self.query(raw)
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Natural-language query tool for the semantic code index.",
@@ -501,7 +391,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     return p
 
-
 def main() -> None:
     parser = _build_parser()
     args   = parser.parse_args()
@@ -530,7 +419,6 @@ def main() -> None:
     else:
         first = " ".join(args.question) if args.question else ""
         querier.run_interactive(first_question=first)
-
 
 if __name__ == "__main__":
     main()

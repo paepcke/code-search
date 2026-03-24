@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-20 09:30:31
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 20:24:19
+# @Last Modified time: 2026-03-23 20:38:27
 # #############################################
 
 """
@@ -25,7 +25,7 @@ Dependencies
 
 A worker thread monitors all directories listed in the CODE_WATCH_DIRS 
 environment variable once a minute. Upon finding a change, it pauses
-query service, re-indexes, and resumes query serice. Incoming queries 
+query service, re-indexes, and resumes query service. Incoming queries 
 are queued during the indexing. 
 
 The environment variable should be modified in the the systemd service
@@ -51,8 +51,8 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 import requests as _requests  # avoid shadowing Flask's `request`
 
-# Re-use the retriever from code_query.py
-from code_search.code_query import (
+# Re-use the retriever and synthesiser from code_query.py
+from code_query import (
     COLLECTION_NAME,
     DEFAULT_MODEL,
     DEFAULT_OLLAMA_URL,
@@ -63,7 +63,7 @@ from code_search.code_query import (
 )
 
 # Import indexer components for the background watcher
-from code_search.code_indexer import (
+from code_indexer import (
     CodeIndexer,
     MtimeManifest,
     MANIFEST_FILENAME,
@@ -83,7 +83,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration  (overridable via environment variables for Gunicorn setups)
 # ---------------------------------------------------------------------------
-
 INDEX_DIR   = Path(os.environ.get("CODE_INDEX_DIR",   str(DEFAULT_INDEX_DIR))).expanduser()
 COLLECTION  = os.environ.get("CODE_COLLECTION",       COLLECTION_NAME)
 OLLAMA_URL  = os.environ.get("CODE_OLLAMA_URL",       DEFAULT_OLLAMA_URL)
@@ -91,11 +90,9 @@ LLM_MODEL   = os.environ.get("CODE_LLM_MODEL",        DEFAULT_MODEL)
 TOP_K       = int(os.environ.get("CODE_TOP_K",        str(DEFAULT_TOP_K)))
 DEFAULT_PORT = 58008
 
-# Parse the colon-separated paths from the environment for the watcher thread
 WATCH_DIRS_STR = os.environ.get("CODE_WATCH_DIRS", "")
 WATCH_DIRS = [Path(p).expanduser().resolve() for p in WATCH_DIRS_STR.split(":") if p.strip()]
 
-# Prompts
 _SYSTEM = (
     "You are a concise assistant that answers questions about a personal "
     "Python and Bash codebase.  Answer in as few words as possible.  "
@@ -105,25 +102,14 @@ _SYSTEM = (
     "in one sentence."
 )
 
-_EXPAND_SYSTEM = (
-    "You are a search query expander for a codebase. "
-    "Given a user's question, output a single string combining the original "
-    "question with 3-4 highly relevant technical synonyms, related terms, "
-    "and rephrasings to maximize vector retrieval overlap. "
-    "Return ONLY the expanded query string, with no introductory text or formatting."
-)
-
 # ---------------------------------------------------------------------------
 # Flask app + Concurrency Setup
 # ---------------------------------------------------------------------------
-
 app = Flask(__name__)
 _retriever: CodeRetriever | None = None
 indexing_lock = threading.Lock()
 
-
 def _get_retriever() -> CodeRetriever:
-    """Return the shared CodeRetriever, initialising it on first call."""
     global _retriever
     if _retriever is None:
         _retriever = CodeRetriever(
@@ -134,11 +120,9 @@ def _get_retriever() -> CodeRetriever:
         )
     return _retriever
 
-
 # ---------------------------------------------------------------------------
 # Background Watcher
 # ---------------------------------------------------------------------------
-
 def _needs_reindexing() -> bool:
     if not WATCH_DIRS:
         return False
@@ -163,7 +147,6 @@ def _needs_reindexing() -> bool:
 
 def _background_watcher():
     while True:
-        # Check immediately before sleeping
         if _needs_reindexing():
             logger.info("Changes detected! Pausing queries to re-index...")
             
@@ -172,7 +155,7 @@ def _background_watcher():
                 if _retriever is not None:
                     _retriever._qdrant.close()
                     _retriever = None
-                    gc.collect() 
+                    gc.collect()  
                 
                 try:
                     indexer = CodeIndexer(
@@ -193,19 +176,17 @@ def _background_watcher():
                     
                 logger.info("Indexing complete. Resuming queries.")
         
-        # Sleep at the END of the loop so the first check happens instantly on startup
+        # Sleep at the bottom of the loop so it checks instantly on startup
         time.sleep(60)
-        
+
 if WATCH_DIRS:
     logger.info(f"Starting background watcher for: {[str(p) for p in WATCH_DIRS]}")
     watcher_thread = threading.Thread(target=_background_watcher, daemon=True)
     watcher_thread.start()
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 def _build_context(chunks: list[dict]) -> str:
     parts = []
     for i, chunk in enumerate(chunks, 1):
@@ -215,29 +196,6 @@ def _build_context(chunks: list[dict]) -> str:
         )
         parts.append(f"{header}\n{chunk['text']}")
     return "\n\n".join(parts)
-
-
-def _call_llm_expand(question: str) -> str:
-    """Use LLM to generate search synonyms to overcome vector vocabulary gaps."""
-    messages = [
-        {"role": "system", "content": _EXPAND_SYSTEM},
-        {"role": "user", "content": question}
-    ]
-    try:
-        resp = _requests.post(
-            f"{OLLAMA_URL.rstrip('/')}/api/chat",
-            json={
-                "model":    LLM_MODEL,
-                "messages": messages,
-                "stream":   False,
-                "options":  {"temperature": 0.2},
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json().get("message", {}).get("content", "").strip()
-    except _requests.exceptions.RequestException:
-        return question
 
 def _call_llm(history: list[dict]) -> str:
     messages = [{"role": "system", "content": _SYSTEM}] + history
@@ -261,11 +219,9 @@ def _call_llm(history: list[dict]) -> str:
     except _requests.exceptions.RequestException as exc:
         return f"[LLM error] {exc}"
 
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-
 @app.get("/")
 def health():
     return jsonify({
@@ -276,7 +232,6 @@ def health():
         "top_k":      TOP_K,
         "watch_dirs": [str(d) for d in WATCH_DIRS],
     })
-
 
 @app.post("/query")
 def query():
@@ -292,19 +247,14 @@ def query():
     if not isinstance(history, list):
         return jsonify({"error": "Field 'history' must be a list."}), 400
 
-    # 1. Expand the query for better retrieval
-    expanded_query = _call_llm_expand(question)
-
-    # 2. Retrieval (Wrapped in the lock to wait if indexing is happening)
     with indexing_lock:
         try:
             retriever = _get_retriever()
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 503
 
-        chunks = retriever.retrieve(expanded_query)
+        chunks = retriever.retrieve(question)
 
-    # 3. Build user turn using the ORIGINAL question (prevents confusing the LLM)
     context      = _build_context(chunks)
     user_content = (
         f"QUESTION:\n{question}\n\n"
@@ -314,22 +264,19 @@ def query():
     history = list(history)
     history.append({"role": "user", "content": user_content})
 
-    # 4. LLM synthesis
     answer = _call_llm(history)
     history.append({"role": "assistant", "content": answer})
 
+    # Note: text is intentionally NOT stripped so --show-context works on remote clients
     return jsonify({
         "answer":  answer,
         "chunks":  chunks,
         "history": history,
-        "expanded_query": expanded_query,  # Pass it back for debugging clients
     })
 
-
 # ---------------------------------------------------------------------------
-# CLI  (for quick testing without Gunicorn)
+# CLI
 # ---------------------------------------------------------------------------
-
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Code search HTTP API server (use Gunicorn in production).",
@@ -349,7 +296,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     return p
 
-
 def main() -> None:
     parser = _build_parser()
     args   = parser.parse_args()
@@ -357,7 +303,6 @@ def main() -> None:
     logger.info(f"  Index : {INDEX_DIR}")
     logger.info(f"  Model : {LLM_MODEL}")
     app.run(host=args.host, port=args.port, debug=False)
-
 
 if __name__ == "__main__":
     main()

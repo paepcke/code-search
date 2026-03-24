@@ -4,9 +4,8 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:10:41
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 20:16:41
+# @Last Modified time: 2026-03-23 20:37:57
 # ##############################################
-
 """
 code_indexer.py  --  Semantic code indexer for personal Python/Bash repositories.
 
@@ -25,9 +24,9 @@ NOTE: used by code_search_server.py. Do not run directly.
 
 Walks one or more root directories, extracts function- and class-level chunks
 from ``*.py`` and ``*.sh`` files using tree-sitter, embeds each chunk with
-``nomic-embed-text`` via Ollama, generates Sparse Vectors (BM25/TF-IDF) for 
-hybrid search, and upserts them into a file-based Qdrant collection.  
-Re-runs are incremental.
+``nomic-embed-text`` via Ollama, and upserts them into a file-based Qdrant
+collection.  Re-runs are incremental: only files whose mtime has changed
+since the last run are re-processed.
 
 Usage
 -----
@@ -41,37 +40,27 @@ Options
     --batch-size  N      Embedding batch size.  Default: 32
     --force              Ignore the mtime manifest and re-index everything.
     --verbose            Print each file as it is processed.
-
-Dependencies
-------------
-    pip install "qdrant-client>=1.8.0" requests tree-sitter \
-                tree-sitter-python tree-sitter-bash
-    ollama pull nomic-embed-text
 """
 
 import argparse
-import hashlib
 import json
 import os
-import re
 import sys
 import time
 import uuid
-from collections import Counter
 from pathlib import Path
 from typing import Generator
 
-from qdrant_client import QdrantClient, models
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, VectorParams
 import requests
 from tree_sitter import Language, Node, Parser
 import tree_sitter_python as tspython
 import tree_sitter_bash as tsbash
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
 OLLAMA_EMBED_MODEL = "nomic-embed-text"
 EMBEDDING_DIM = 768
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -83,44 +72,10 @@ PY_CHUNK_TYPES = {"function_definition", "class_definition"}
 SH_CHUNK_TYPES = {"function_definition"}
 MIN_CHUNK_CHARS = 15
 
-
-# ---------------------------------------------------------------------------
-# Tokenizer / Sparse Vector Generator
-# ---------------------------------------------------------------------------
-
-def _to_sparse_vector(text: str) -> models.SparseVector | None:
-    """Hash alphanumeric words into a sparse TF (Term Frequency) vector.
-    Qdrant will automatically apply the global IDF mathematics on its end.
-    """
-    # Extract alphanumeric words (including underscores for code)
-    tokens = re.findall(r'\b[a-zA-Z0-9_]+\b', text.lower())
-    if not tokens:
-        return None
-        
-    counts = Counter(tokens)
-    indices_values = []
-    
-    for token, freq in counts.items():
-        # Feature hashing: convert token string to a stable 32-bit integer
-        idx = int(hashlib.md5(token.encode('utf-8')).hexdigest()[:8], 16)
-        indices_values.append((idx, float(freq)))
-        
-    # Qdrant strictly requires sparse indices to be sorted
-    indices_values.sort(key=lambda x: x[0])
-    
-    return models.SparseVector(
-        indices=[x[0] for x in indices_values],
-        values=[x[1] for x in indices_values]
-    )
-
-
 # ---------------------------------------------------------------------------
 # Chunker
 # ---------------------------------------------------------------------------
-
 class CodeChunker:
-    """Parse source files with tree-sitter and yield logical chunks."""
-
     def __init__(self) -> None:
         self._py_parser = Parser(Language(tspython.language()))
         self._sh_parser = Parser(Language(tsbash.language()))
@@ -171,9 +126,7 @@ class CodeChunker:
         return chunks
 
     @staticmethod
-    def _walk_top_level(
-        root: Node, target_types: set[str]
-    ) -> Generator[Node, None, None]:
+    def _walk_top_level(root: Node, target_types: set[str]) -> Generator[Node, None, None]:
         for child in root.children:
             if child.type in target_types:
                 yield child
@@ -244,11 +197,9 @@ class CodeChunker:
             "name": "semantic_summary",
         }
 
-
 # ---------------------------------------------------------------------------
 # Manifest (mtime tracking)
 # ---------------------------------------------------------------------------
-
 class MtimeManifest:
     def __init__(self, manifest_path: Path) -> None:
         self._path = manifest_path
@@ -283,11 +234,9 @@ class MtimeManifest:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(self._data, indent=2))
 
-
 # ---------------------------------------------------------------------------
 # Indexer
 # ---------------------------------------------------------------------------
-
 class CodeIndexer:
     def __init__(
         self,
@@ -324,10 +273,10 @@ class CodeIndexer:
                 timeout=5,
             )
             resp.raise_for_status()
-            tags = [m["name"] for m in resp.json().get("models", [])]
+            models_list = [m["name"] for m in resp.json().get("models", [])]
             available = any(
                 m == OLLAMA_EMBED_MODEL or m.startswith(OLLAMA_EMBED_MODEL + ":")
-                for m in tags
+                for m in models_list
             )
             if not available:
                 print(
@@ -348,23 +297,13 @@ class CodeIndexer:
     def _ensure_collection(self) -> None:
         existing = {c.name for c in self._qdrant.get_collections().collections}
         if self._collection not in existing:
-            # We must instruct Qdrant to build both a Dense and a Sparse index
             self._qdrant.create_collection(
                 collection_name=self._collection,
-                vectors_config={
-                    "dense": models.VectorParams(
-                        size=EMBEDDING_DIM, 
-                        distance=models.Distance.COSINE
-                    )
-                },
-                sparse_vectors_config={
-                    # Modifier.IDF is the magic that calculates BM25 IDF in the background
-                    "sparse": models.SparseVectorParams(
-                        modifier=models.Modifier.IDF
-                    )
-                }
+                vectors_config=VectorParams(
+                    size=EMBEDDING_DIM, distance=Distance.COSINE
+                ),
             )
-            print(f"Created Qdrant Hybrid collection '{self._collection}'.")
+            print(f"Created Qdrant collection '{self._collection}'.")
         else:
             print(f"Using existing Qdrant collection '{self._collection}'.")
 
@@ -444,13 +383,14 @@ class CodeIndexer:
                     yield p
 
     def _delete_file_points(self, filepath: str) -> None:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
         self._qdrant.delete(
             collection_name=self._collection,
-            points_selector=models.Filter(
+            points_selector=Filter(
                 must=[
-                    models.FieldCondition(
+                    FieldCondition(
                         key="filepath",
-                        match=models.MatchValue(value=filepath),
+                        match=MatchValue(value=filepath),
                     )
                 ]
             ),
@@ -478,40 +418,26 @@ class CodeIndexer:
             )
             return
 
-        points = []
-        for vec, chunk in zip(vectors, chunks):
-            
-            # Generate the Sparse Vector for BM25
-            sparse_vec = _to_sparse_vector(chunk["text"])
-            if not sparse_vec:
-                continue # Skip chunks entirely devoid of alphanumeric characters
-                
-            points.append(
-                models.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector={
-                        "dense": vec,
-                        "sparse": sparse_vec
-                    },
-                    payload={
-                        "filepath": chunk["filepath"],
-                        "start_line": chunk["start_line"],
-                        "end_line": chunk["end_line"],
-                        "kind": chunk["kind"],
-                        "name": chunk["name"],
-                        "text": chunk["text"],
-                    },
-                )
+        points = [
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vec,
+                payload={
+                    "filepath": chunk["filepath"],
+                    "start_line": chunk["start_line"],
+                    "end_line": chunk["end_line"],
+                    "kind": chunk["kind"],
+                    "name": chunk["name"],
+                    "text": chunk["text"],
+                },
             )
-            
-        if points:
-            self._qdrant.upsert(collection_name=self._collection, points=points)
-
+            for vec, chunk in zip(vectors, chunks)
+        ]
+        self._qdrant.upsert(collection_name=self._collection, points=points)
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Semantic code indexer for Python/Bash repositories.",
@@ -562,7 +488,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     return p
 
-
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
@@ -582,7 +507,6 @@ def main() -> None:
         verbose=args.verbose,
     )
     indexer.index_roots(roots)
-
 
 if __name__ == "__main__":
     main()
