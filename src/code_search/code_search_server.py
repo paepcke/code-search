@@ -4,7 +4,7 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-20 09:30:31
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 20:00:40
+# @Last Modified time: 2026-03-23 20:24:19
 # #############################################
 
 """
@@ -163,7 +163,7 @@ def _needs_reindexing() -> bool:
 
 def _background_watcher():
     while True:
-        time.sleep(60)
+        # Check immediately before sleeping
         if _needs_reindexing():
             logger.info("Changes detected! Pausing queries to re-index...")
             
@@ -192,7 +192,10 @@ def _background_watcher():
                         gc.collect()
                     
                 logger.info("Indexing complete. Resuming queries.")
-
+        
+        # Sleep at the END of the loop so the first check happens instantly on startup
+        time.sleep(60)
+        
 if WATCH_DIRS:
     logger.info(f"Starting background watcher for: {[str(p) for p in WATCH_DIRS]}")
     watcher_thread = threading.Thread(target=_background_watcher, daemon=True)

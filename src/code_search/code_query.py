@@ -4,22 +4,16 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:23:19
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 20:00:10
+# @Last Modified time: 2026-03-23 20:17:57
 # ############################################
+
 """
 code_query.py  --  Natural-language query interface for the semantic code index.
 
 Embeds natural-language questions with ``nomic-embed-text`` via Ollama,
-retrieves the most relevant code chunks from the file-based Qdrant collection
-built by ``code_indexer.py``, and asks a local LLM (via Ollama) to synthesise
+generates a sparse TF-IDF keyword vector, retrieves and mathematically merges 
+the most relevant hybrid chunks from Qdrant, and asks a local LLM to synthesise
 an answer.
-
-By default, runs as an interactive REPL and outputs ONLY the LLM's answer.
-Type your question at the prompt; the LLM sees the full conversation history
-so follow-up questions work naturally. Special commands:
-
-    new  /new       Clear conversation history and start a fresh topic.
-    quit exit /q    Exit the program.
 
 Usage
 -----
@@ -41,13 +35,16 @@ Options
 """
 
 import argparse
+import hashlib
+import re
 import readline  # noqa: F401
 import sys
 import textwrap
+from collections import Counter
 from pathlib import Path
 
 import requests
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +59,34 @@ DEFAULT_OLLAMA_URL  = "http://localhost:11434"
 DEFAULT_MODEL       = "llama3:8b"
 DEFAULT_TOP_K       = 5
 
-# Visual formatting
 RULE      = "─" * 72
 THIN_RULE = "╌" * 72
-
-# Interactive-mode special commands
 CMD_NEW  = {"new", "/new"}
 CMD_QUIT = {"quit", "exit", "/q"}
+
+# ---------------------------------------------------------------------------
+# Tokenizer / Sparse Vector Generator
+# ---------------------------------------------------------------------------
+
+def _to_sparse_vector(text: str) -> models.SparseVector | None:
+    """Must perfectly match the hashing strategy in code_indexer.py"""
+    tokens = re.findall(r'\b[a-zA-Z0-9_]+\b', text.lower())
+    if not tokens:
+        return None
+        
+    counts = Counter(tokens)
+    indices_values = []
+    
+    for token, freq in counts.items():
+        idx = int(hashlib.md5(token.encode('utf-8')).hexdigest()[:8], 16)
+        indices_values.append((idx, float(freq)))
+        
+    indices_values.sort(key=lambda x: x[0])
+    
+    return models.SparseVector(
+        indices=[x[0] for x in indices_values],
+        values=[x[1] for x in indices_values]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +94,7 @@ CMD_QUIT = {"quit", "exit", "/q"}
 # ---------------------------------------------------------------------------
 
 class CodeRetriever:
-    """Embed a query and retrieve the top-k matching chunks from Qdrant."""
+    """Embed a query and perform Hybrid Search (Dense + Sparse) in Qdrant."""
 
     def __init__(
         self,
@@ -98,6 +116,7 @@ class CodeRetriever:
         self._qdrant = QdrantClient(path=str(qdrant_path))
 
     def retrieve(self, question: str) -> list[dict]:
+        # 1. Get Dense Vector
         try:
             resp = requests.post(
                 self._embed_url,
@@ -114,10 +133,35 @@ class CodeRetriever:
         if not embeddings:
             print("ERROR: Ollama returned no embeddings.", file=sys.stderr)
             return []
+            
+        dense_emb = embeddings[0]
 
+        # 2. Get Sparse Vector (TF mapped to Qdrant's IDF)
+        sparse_emb = _to_sparse_vector(question)
+
+        # 3. Build Prefetch rules for Hybrid fusion
+        prefetch = [
+            models.Prefetch(
+                query=dense_emb,
+                using="dense",
+                limit=self._top_k * 2,
+            )
+        ]
+        
+        if sparse_emb is not None:
+            prefetch.append(
+                models.Prefetch(
+                    query=sparse_emb,
+                    using="sparse",
+                    limit=self._top_k * 2,
+                )
+            )
+
+        # 4. Execute Hybrid Search using Reciprocal Rank Fusion (RRF)
         result = self._qdrant.query_points(
             collection_name=self._collection,
-            query=embeddings[0],
+            prefetch=prefetch,
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
             limit=self._top_k,
             with_payload=True,
         )
@@ -125,8 +169,9 @@ class CodeRetriever:
         hits = []
         for hit in result.points:
             payload = dict(hit.payload)
-            payload["score"] = round(hit.score, 4)
+            payload["score"] = round(hit.score, 4) if hit.score else 0.0
             hits.append(payload)
+            
         return hits
 
 
@@ -135,8 +180,6 @@ class CodeRetriever:
 # ---------------------------------------------------------------------------
 
 class LLMSynthesiser:
-    """Ask a local Ollama model to explain retrieved code chunks and expand queries."""
-
     _SYSTEM = (
         "You are a concise assistant that answers questions about a personal "
         "Python and Bash codebase.  Answer in as few words as possible.  "
@@ -167,7 +210,6 @@ class LLMSynthesiser:
         self._history = []
 
     def expand(self, question: str) -> str:
-        """Use the LLM to generate search synonyms to overcome vector vocabulary gaps."""
         messages = [
             {"role": "system", "content": self._EXPAND_SYSTEM},
             {"role": "user", "content": question}
@@ -186,7 +228,6 @@ class LLMSynthesiser:
             resp.raise_for_status()
             return resp.json().get("message", {}).get("content", "").strip()
         except requests.exceptions.RequestException:
-            # Fallback to the original question if the LLM is busy/fails
             return question
 
     def explain(self, question: str, chunks: list[dict]) -> str:
@@ -239,8 +280,6 @@ class LLMSynthesiser:
 # ---------------------------------------------------------------------------
 
 class ResultPrinter:
-    """Format and print query results to stdout."""
-
     def __init__(self, show_sources: bool = False, show_context: bool = False) -> None:
         self._show_sources = show_sources
         self._show_context = show_context
@@ -256,7 +295,6 @@ class ResultPrinter:
         print(RULE)
         print(f"  QUERY:  {question}")
         
-        # Display the expanded query if debugging flags are on
         if (self._show_sources or self._show_context) and expanded_query and expanded_query != question:
             print(f"  EXPANDED: {expanded_query}")
             
@@ -266,7 +304,6 @@ class ResultPrinter:
             print("\n  No matching chunks found.\n")
             return
 
-        # Print LLM Answer First (if LLM is enabled)
         if explanation is not None:
             print("\n  ANSWER:\n")
             for line in explanation.splitlines():
@@ -276,7 +313,6 @@ class ResultPrinter:
                     print(f"  {line}")
             print()
 
-        # Print Sources / Context if requested (or if LLM is disabled)
         if self._show_sources or self._show_context or explanation is None:
             print(RULE)
             print(f"  RETRIEVED CONTEXT ({len(chunks)} chunks)")
@@ -296,11 +332,9 @@ class ResultPrinter:
         name     = chunk.get("name") or "(unnamed)"
         score    = chunk.get("score", 0.0)
 
-        # Always print metadata if this section is triggered
         print(f"\n  [{index}] {filepath}")
         print(f"        Lines {start}–{end} │ {kind}: {name} │ score: {score:.4f}")
 
-        # Print the text only if show_context is true and available
         if self._show_context and "text" in chunk:
             print()
             lines = chunk["text"].splitlines()
@@ -315,8 +349,6 @@ class ResultPrinter:
 # ---------------------------------------------------------------------------
 
 class CodeQuerier:
-    """Orchestrate retrieval, LLM synthesis, and result printing."""
-
     def __init__(
         self,
         index_dir: Path,
@@ -349,15 +381,12 @@ class CodeQuerier:
     def query(self, question: str) -> None:
         expanded_query = question
         
-        # 1. Expand the Query
         if self._use_llm and self._synthesiser is not None:
             print("Expanding query ...")
             expanded_query = self._synthesiser.expand(question)
 
-        # 2. Retrieve using the EXPANDED query
         chunks = self._retriever.retrieve(expanded_query)
 
-        # 3. Synthesize the answer using the ORIGINAL question
         explanation: str | None = None
         if self._use_llm and self._synthesiser is not None:
             print("Asking LLM ...")
