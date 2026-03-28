@@ -4,8 +4,9 @@
 # @Author: Andreas Paepcke
 # @Date:   2026-03-18 18:10:41
 # @Last Modified by:   Andreas Paepcke
-# @Last Modified time: 2026-03-23 20:37:57
+# @Last Modified time: 2026-03-24 09:35:43
 # ##############################################
+
 """
 code_indexer.py  --  Semantic code indexer for personal Python/Bash repositories.
 
@@ -45,6 +46,7 @@ Options
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -72,15 +74,66 @@ PY_CHUNK_TYPES = {"function_definition", "class_definition"}
 SH_CHUNK_TYPES = {"function_definition"}
 MIN_CHUNK_CHARS = 15
 
+# Minimum lines a docstring must have to earn its own standalone chunk.
+# A single-line ":param x: …" block is not worth indexing alone; a
+# multi-sentence description is.
+MIN_DOCSTRING_LINES = 3
+
+# Patterns that flag a statement as configuration-related.
+_CONFIG_PATTERNS = re.compile(
+    r"os\.environ\.get\s*\("                            # env-var reads
+    r"|\.add_argument\s*\("                             # argparse flags
+    r"|^[A-Z][A-Z0-9_]{2,}\s*=\s*"                     # ALL_CAPS constants …
+    r"(?:[\"'\/]|Path|True|False|[A-Z][A-Z0-9_]{2,})"  # … with config-like RHS
+)
+
 # ---------------------------------------------------------------------------
 # Chunker
 # ---------------------------------------------------------------------------
 class CodeChunker:
+    """Extract semantic chunks from Python and Bash source files.
+
+    Produces up to five distinct chunk kinds per file:
+
+    ``module_doc``
+        The module-level docstring (Python) or leading block comment (Bash).
+        Stands alone so that operational/configuration prose is always
+        findable regardless of how the rest of the file is chunked.
+
+    ``docstring``
+        The docstring of a function or class, emitted as a standalone chunk
+        when it contains enough prose to be meaningful on its own
+        (≥ ``MIN_DOCSTRING_LINES`` lines).  Tagged with the parent's name so
+        the LLM can trace it back.
+
+    ``config``
+        A window of lines centred on a configuration-related statement —
+        ``os.environ.get``, ``argparse.add_argument``, or a
+        ``MODULE_LEVEL_CONSTANT = …`` assignment — together with any
+        immediately preceding comment block.  Captures the operational
+        vocabulary (env-var names, flag names, default values) that
+        docstrings sometimes omit.
+
+    ``function`` / ``class``
+        The full source of each top-level function or class definition,
+        unchanged from the original behaviour.
+
+    ``file_skeleton``
+        A condensed view of the whole file: function/class names plus
+        inline comments.  Module docstrings are *excluded* here because
+        they already appear in their own ``module_doc`` chunk.
+    """
+
     def __init__(self) -> None:
         self._py_parser = Parser(Language(tspython.language()))
         self._sh_parser = Parser(Language(tsbash.language()))
 
     def chunks_from_file(self, path: Path) -> list[dict]:
+        """Return all chunks extracted from *path*.
+
+        :param path: Source file to chunk (.py or .sh).
+        :return: List of chunk dicts ready for embedding and upsert.
+        """
         try:
             source = path.read_bytes()
         except OSError:
@@ -93,37 +146,265 @@ class CodeChunker:
             return self._chunk_bash(source, path)
         return []
 
+    # ------------------------------------------------------------------
+    # Language-specific entry points
+    # ------------------------------------------------------------------
+
     def _chunk_python(self, source: bytes, path: Path) -> list[dict]:
-        tree = self._py_parser.parse(source)
+        tree  = self._py_parser.parse(source)
         lines = source.decode("utf-8", errors="replace").splitlines()
         chunks: list[dict] = []
 
-        for node in self._walk_top_level(tree.root_node, PY_CHUNK_TYPES):
-            chunk = self._node_to_chunk(node, lines)
-            if chunk:
-                chunks.append(chunk)
+        # 1. Module docstring — own chunk
+        mod_doc = self._extract_module_doc_python(tree.root_node, lines)
+        if mod_doc:
+            chunks.append(mod_doc)
 
-        skeleton = self._semantic_skeleton(tree, lines, "python")
+        # 2. Config chunks (env vars, argparse flags, module constants)
+        for cfg in self._extract_config_chunks(lines):
+            chunks.append(cfg)
+
+        # 3. Function / class bodies
+        for node in self._walk_top_level(tree.root_node, PY_CHUNK_TYPES):
+            body_chunk = self._node_to_chunk(node, lines)
+            if body_chunk:
+                chunks.append(body_chunk)
+            # 4. Standalone docstring for this function/class
+            ds = self._extract_docstring_chunk(node, lines)
+            if ds:
+                chunks.append(ds)
+
+        # 5. File skeleton (module docstring lines excluded)
+        skeleton = self._semantic_skeleton(
+            tree, lines, "python", skip_module_doc=mod_doc is not None
+        )
         if skeleton:
             chunks.insert(0, skeleton)
 
         return chunks
 
     def _chunk_bash(self, source: bytes, path: Path) -> list[dict]:
-        tree = self._sh_parser.parse(source)
+        tree  = self._sh_parser.parse(source)
         lines = source.decode("utf-8", errors="replace").splitlines()
         chunks: list[dict] = []
 
+        # 1. Leading block comment as module_doc equivalent
+        mod_doc = self._extract_module_doc_bash(lines)
+        if mod_doc:
+            chunks.append(mod_doc)
+
+        # 2. Config lines (env-var reads / variable assignments)
+        for cfg in self._extract_config_chunks(lines):
+            chunks.append(cfg)
+
+        # 3. Function bodies
         for node in self._walk_top_level(tree.root_node, SH_CHUNK_TYPES):
             chunk = self._node_to_chunk(node, lines)
             if chunk:
                 chunks.append(chunk)
 
-        skeleton = self._semantic_skeleton(tree, lines, "bash")
+        # 4. File skeleton (module doc excluded)
+        skeleton = self._semantic_skeleton(
+            tree, lines, "bash", skip_module_doc=mod_doc is not None
+        )
         if skeleton:
             chunks.insert(0, skeleton)
 
         return chunks
+
+    # ------------------------------------------------------------------
+    # Module-doc extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_module_doc_python(root: Node, lines: list[str]) -> dict | None:
+        """Return the module-level docstring as a ``module_doc`` chunk.
+
+        :param root: Root node of the parsed tree.
+        :param lines: Source lines.
+        :return: Chunk dict or ``None`` if no module docstring is present.
+        """
+        for child in root.children:
+            if child.type == "expression_statement":
+                if (len(child.children) == 1
+                        and child.children[0].type == "string"):
+                    start = child.start_point[0]
+                    end   = child.end_point[0]
+                    text  = "\n".join(lines[start : end + 1]).strip()
+                    if len(text) >= MIN_CHUNK_CHARS:
+                        return {
+                            "text":       text,
+                            "start_line": start + 1,
+                            "end_line":   end + 1,
+                            "kind":       "module_doc",
+                            "name":       "module_docstring",
+                        }
+            # Module docstring must be the first non-trivial statement
+            if child.type not in {"comment", "expression_statement"}:
+                break
+        return None
+
+    @staticmethod
+    def _extract_module_doc_bash(lines: list[str]) -> dict | None:
+        """Return the leading comment block as a ``module_doc`` chunk.
+
+        :param lines: Source lines.
+        :return: Chunk dict or ``None`` if no leading comment block.
+        """
+        comment_lines: list[int] = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                comment_lines.append(i)
+            elif stripped == "":
+                if comment_lines:
+                    # Allow one blank line gap inside a block
+                    continue
+            else:
+                break
+
+        if not comment_lines:
+            return None
+
+        start = comment_lines[0]
+        end   = comment_lines[-1]
+        text  = "\n".join(lines[start : end + 1]).strip()
+        if len(text) < MIN_CHUNK_CHARS:
+            return None
+
+        return {
+            "text":       text,
+            "start_line": start + 1,
+            "end_line":   end + 1,
+            "kind":       "module_doc",
+            "name":       "module_comment",
+        }
+
+    # ------------------------------------------------------------------
+    # Per-function/class docstring extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_docstring_chunk(node: Node, lines: list[str]) -> dict | None:
+        """Emit a standalone ``docstring`` chunk for *node* if the docstring
+        is prose-rich enough to justify its own embedding.
+
+        :param node: A ``function_definition`` or ``class_definition`` node.
+        :param lines: Source lines.
+        :return: Chunk dict or ``None``.
+        """
+        # Find the body node
+        body = None
+        for child in node.children:
+            if child.type in ("block", "suite"):
+                body = child
+                break
+        if body is None:
+            return None
+
+        # First statement of the body — must be an expression_statement
+        # containing a string literal
+        for child in body.children:
+            if child.type == "expression_statement":
+                if (len(child.children) == 1
+                        and child.children[0].type == "string"):
+                    start = child.start_point[0]
+                    end   = child.end_point[0]
+                    text  = "\n".join(lines[start : end + 1]).strip()
+                    num_lines = end - start + 1
+                    if num_lines < MIN_DOCSTRING_LINES:
+                        return None
+                    # Derive parent name
+                    parent_name = ""
+                    for c in node.children:
+                        if c.type == "identifier":
+                            parent_name = c.text.decode("utf-8", errors="replace")
+                            break
+                    kind_label = (
+                        "class" if node.type == "class_definition" else "function"
+                    )
+                    return {
+                        "text":       text,
+                        "start_line": start + 1,
+                        "end_line":   end + 1,
+                        "kind":       "docstring",
+                        "name":       f"{kind_label}:{parent_name}",
+                    }
+            # Only the very first non-trivial child counts
+            if child.type not in {"comment", "newline", "indent"}:
+                break
+        return None
+
+    # ------------------------------------------------------------------
+    # Config chunk extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_config_chunks(lines: list[str]) -> list[dict]:
+        """Yield ``config`` chunks centred on configuration-related statements.
+
+        Each chunk contains the triggering line plus any immediately
+        preceding comment block (up to 8 lines) and one trailing line of
+        context.  Overlapping windows are merged so a dense block of
+        constants produces one chunk rather than N almost-identical ones.
+
+        :param lines: Source lines.
+        :return: List of config chunk dicts.
+        """
+        # Collect indices of lines that match a config pattern
+        trigger_indices: list[int] = []
+        for i, line in enumerate(lines):
+            if _CONFIG_PATTERNS.search(line):
+                trigger_indices.append(i)
+
+        if not trigger_indices:
+            return []
+
+        MAX_COMMENT_LOOKBACK = 8
+        TRAIL = 1  # lines of context after the trigger
+
+        # Build windows [start, end] around each trigger
+        windows: list[tuple[int, int]] = []
+        for idx in trigger_indices:
+            # Walk back to collect the preceding comment block
+            comment_start = idx
+            for back in range(1, MAX_COMMENT_LOOKBACK + 1):
+                prev = idx - back
+                if prev < 0:
+                    break
+                stripped = lines[prev].strip()
+                if stripped.startswith("#") or stripped == "":
+                    comment_start = prev
+                else:
+                    break
+            end = min(idx + TRAIL, len(lines) - 1)
+            windows.append((comment_start, end))
+
+        # Merge overlapping / adjacent windows
+        merged: list[tuple[int, int]] = [windows[0]]
+        for start, end in windows[1:]:
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end + 1:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+
+        chunks: list[dict] = []
+        for start, end in merged:
+            text = "\n".join(lines[start : end + 1]).strip()
+            if len(text) >= MIN_CHUNK_CHARS:
+                chunks.append({
+                    "text":       text,
+                    "start_line": start + 1,
+                    "end_line":   end + 1,
+                    "kind":       "config",
+                    "name":       "configuration",
+                })
+        return chunks
+
+    # ------------------------------------------------------------------
+    # Shared helpers (unchanged contract, minor extension)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _walk_top_level(root: Node, target_types: set[str]) -> Generator[Node, None, None]:
@@ -151,26 +432,64 @@ class CodeChunker:
 
         kind = "class" if node.type == "class_definition" else "function"
         return {
-            "text": text,
+            "text":       text,
             "start_line": start + 1,
-            "end_line": end + 1,
-            "kind": kind,
-            "name": name,
+            "end_line":   end + 1,
+            "kind":       kind,
+            "name":       name,
         }
 
     @staticmethod
-    def _semantic_skeleton(tree: Node, lines: list[str], lang: str) -> dict | None:
+    def _semantic_skeleton(
+        tree: Node,
+        lines: list[str],
+        lang: str,
+        skip_module_doc: bool = False,
+    ) -> dict | None:
+        """Build a condensed file skeleton: function/class names + inline comments.
+
+        Module docstring lines are excluded when *skip_module_doc* is True
+        because they are already emitted as a ``module_doc`` chunk.
+
+        :param tree: Parsed tree for the file.
+        :param lines: Source lines.
+        :param lang: ``"python"`` or ``"bash"``.
+        :param skip_module_doc: If True, omit the module-level docstring lines.
+        :return: Skeleton chunk dict or ``None``.
+        """
         lines_to_keep: set[int] = set()
 
+        # Determine which lines belong to the module docstring so we can
+        # optionally exclude them from the skeleton.
+        module_doc_lines: set[int] = set()
+        if skip_module_doc and lang == "python":
+            for child in tree.root_node.children:
+                if child.type == "expression_statement":
+                    if (len(child.children) == 1
+                            and child.children[0].type == "string"):
+                        module_doc_lines.update(
+                            range(child.start_point[0], child.end_point[0] + 1)
+                        )
+                if child.type not in {"comment", "expression_statement"}:
+                    break
+
         def walk(node: Node) -> None:
-            if node.type == 'comment':
-                lines_to_keep.update(range(node.start_point[0], node.end_point[0] + 1))
-            elif lang == "python" and node.type == 'expression_statement':
-                if len(node.children) == 1 and node.children[0].type == 'string':
-                    lines_to_keep.update(range(node.start_point[0], node.end_point[0] + 1))
-            elif node.type in {'function_definition', 'class_definition'}:
+            if node.type == "comment":
+                lines_to_keep.update(
+                    range(node.start_point[0], node.end_point[0] + 1)
+                )
+            elif lang == "python" and node.type == "expression_statement":
+                if len(node.children) == 1 and node.children[0].type == "string":
+                    line_range = range(
+                        node.start_point[0], node.end_point[0] + 1
+                    )
+                    if not skip_module_doc or not module_doc_lines.intersection(
+                        line_range
+                    ):
+                        lines_to_keep.update(line_range)
+            elif node.type in {"function_definition", "class_definition"}:
                 for child in node.children:
-                    if child.type == 'identifier':
+                    if child.type == "identifier":
                         lines_to_keep.add(child.start_point[0])
                         break
                 else:
@@ -183,18 +502,20 @@ class CodeChunker:
         if not lines_to_keep:
             return None
 
-        skeleton_lines = [lines[i] for i in sorted(lines_to_keep) if i < len(lines)]
+        skeleton_lines = [
+            lines[i] for i in sorted(lines_to_keep) if i < len(lines)
+        ]
         text = "\n".join(skeleton_lines).strip()
-        
+
         if len(text) < MIN_CHUNK_CHARS:
             return None
-            
+
         return {
-            "text": text,
+            "text":       text,
             "start_line": 1,
-            "end_line": len(lines),
-            "kind": "file_skeleton",
-            "name": "semantic_summary",
+            "end_line":   len(lines),
+            "kind":       "file_skeleton",
+            "name":       "semantic_summary",
         }
 
 # ---------------------------------------------------------------------------

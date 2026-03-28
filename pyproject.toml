@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 # The name of your project. This is the name PyPI will use.
-name = "code-seach"
+name = "code-search"
 # The project's version (e.g., v0.1.0)
 version = "0.0.1"
 # A short description of your project
